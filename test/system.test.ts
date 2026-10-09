@@ -1,0 +1,583 @@
+import { authService } from '../src/modules/auth/auth.service';
+import { patientService } from '../src/modules/patient/patient.service';
+import { doctorService } from '../src/modules/doctor/doctor.service';
+import { tokenService } from '../src/modules/token/token.service';
+import { appointmentService } from '../src/modules/appointment/appointment.service';
+import { queueService } from '../src/modules/queue/queue.service';
+import { clinicalService } from '../src/modules/clinical/clinical.service';
+import { prescriptionVersionService } from '../src/modules/clinical/prescription-version.service';
+import { notificationService } from '../src/modules/notification/notification.service';
+import { medicalSafetyGuard } from '../src/modules/ai-agent/safety/medical-safety.guard';
+import { aiAgentOrchestrator } from '../src/modules/ai-agent/ai.orchestrator';
+import { appointmentReminderService } from '../src/modules/appointment/appointment-reminder.service';
+import { sanitizeClinicalResponse } from '../src/common/middleware/rbac.middleware';
+import { adminService } from '../src/modules/admin/admin.service';
+import { pharmacyService } from '../src/modules/pharmacy/pharmacy.service';
+import { db } from '../src/common/data/mock-db';
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition: boolean, testName: string, detail?: string) {
+  if (condition) {
+    console.log(`  ✅ PASS: ${testName}`);
+    passed++;
+  } else {
+    console.error(`  ❌ FAIL: ${testName} ${detail ? `(${detail})` : ''}`);
+    failed++;
+  }
+}
+
+async function runSystemTestSuite() {
+  db.resetToDefaultDemo();
+  console.log('\n========================================================');
+  console.log('🧪 RUNNING HOSPITAL MANAGEMENT SYSTEM ARCHITECTURAL TESTS');
+  console.log('========================================================\n');
+
+  // TEST 1: Token Engine - Mathematical Invariants & Non-Reusability
+  console.log('--- TEST GROUP 1: MATHEMATICAL TOKEN ENGINE & NON-REUSABILITY ---');
+  const today = new Date().toISOString().split('T')[0];
+  const doc1Id = 'doc-01';
+
+  const matrixBefore = await tokenService.getDoctorTokensMatrix(doc1Id, today);
+  const allocatedToken = await tokenService.allocateToken(doc1Id, today);
+  assert(
+    allocatedToken.tokenNumber === matrixBefore.maxSequenceIssued + 1,
+    'Sequential Token Number Allocation (T_max + 1)',
+    `Expected ${matrixBefore.maxSequenceIssued + 1}, got ${allocatedToken.tokenNumber}`
+  );
+
+  await tokenService.cancelToken(allocatedToken.id);
+  const matrixAfterCancel = await tokenService.getDoctorTokensMatrix(doc1Id, today);
+  const nextTokenAfterCancel = await tokenService.allocateToken(doc1Id, today);
+
+  assert(
+    nextTokenAfterCancel.tokenNumber > allocatedToken.tokenNumber,
+    'Non-Reusability Rule: Cancelled token slot is permanently locked and never reassigned',
+    `Cancelled was #${allocatedToken.tokenNumber}, Next is #${nextTokenAfterCancel.tokenNumber}`
+  );
+
+  // TEST 2: Queue Engine - "Call Next Patient" Skip Logic
+  console.log('\n--- TEST GROUP 2: QUEUE ENGINE "CALL NEXT" SKIP LOGIC ---');
+  // In seed: Token 3 is NOT_CHECKED_IN, Token 4 is WAITING
+  const t3 = db.dailyTokens.find(t => t.doctorId === doc1Id && t.date === today && t.tokenNumber === 3);
+  const apt3 = t3 ? db.appointments.find(a => a.tokenId === t3.id) : null;
+  const q3 = apt3 ? db.queueEntries.find(q => q.appointmentId === apt3.id) : null;
+  if (q3) q3.queueStatus = 'NOT_CHECKED_IN';
+
+  const t4 = db.dailyTokens.find(t => t.doctorId === doc1Id && t.date === today && t.tokenNumber === 4);
+  const apt4 = t4 ? db.appointments.find(a => a.tokenId === t4.id) : null;
+  const q4 = apt4 ? db.queueEntries.find(q => q.appointmentId === apt4.id) : null;
+  if (q4) q4.queueStatus = 'WAITING';
+  const callNextResult = await queueService.callNextPatient(doc1Id, 'u-doc-01', 'DOCTOR');
+  assert(
+    callNextResult.tokenNumber === 4,
+    'Call Next Algorithm skips Token 3 (NOT_CHECKED_IN) and summons Token 4 (WAITING)',
+    `Expected Token #4, got Token #${callNextResult.tokenNumber}`
+  );
+  assert(
+    callNextResult.calledQueueEntry.queueStatus === 'CALLED',
+    'Called Queue Entry mutated from WAITING -> CALLED'
+  );
+
+  // TEST 3: Prescription Versioning Engine (Immutable Git-Style Diff)
+  console.log('\n--- TEST GROUP 3: PRESCRIPTION VERSIONING (v1 -> v2 IMMUTABILITY) ---');
+  const rxAudit = await prescriptionVersionService.getPrescriptionAuditView('rx-01');
+  assert(
+    rxAudit.versionsCount >= 2,
+    'Prescription contains immutable version history (v1 and v2 exist simultaneously)'
+  );
+  const v1 = rxAudit.versions.find(v => v.versionNumber === 1);
+  const v2 = rxAudit.versions.find(v => v.versionNumber === 2);
+  assert(v1?.isCurrent === false, 'Superseded Version 1 marked isCurrent = false');
+  assert(v2?.isCurrent === true, 'Updated Version 2 marked isCurrent = true');
+  assert(
+    Boolean(v2?.correctionReason && v2.correctionReason.length > 5),
+    'Mandatory correction reason captured on version creation'
+  );
+
+  // TEST 4: Clinical Privacy Wall (API-Level Redaction)
+  console.log('\n--- TEST GROUP 4: CLINICAL PRIVACY WALL & RBAC REDACTION ---');
+  const sampleClinicalRecord = {
+    id: 'cr-test',
+    diagnosis: 'Cardiomegaly',
+    examinationNotes: 'Systolic murmur audible at apex',
+    chiefComplaint: 'Chest tightness',
+    treatmentPlan: 'Echocardiogram required',
+    privateNotes: 'Sensitive doctor private note: patient expressed psychological stress',
+    prescriptions: [{ id: 'rx-test', versions: [{ versionNumber: 1, isCurrent: false }, { versionNumber: 2, isCurrent: true }] }]
+  };
+
+  const receptionistView = sanitizeClinicalResponse('RECEPTIONIST', sampleClinicalRecord);
+  assert(
+    receptionistView.diagnosis === undefined &&
+    receptionistView.examinationNotes === undefined &&
+    receptionistView.privateNotes === undefined &&
+    receptionistView.prescriptions === undefined,
+    'Receptionist Privacy Wall: Absolute zero access to Diagnosis, Exam, Notes, Prescriptions'
+  );
+
+  const patientView = sanitizeClinicalResponse('PATIENT', sampleClinicalRecord);
+  assert(
+    patientView.diagnosis === 'Cardiomegaly' &&
+    patientView.privateNotes === undefined &&
+    patientView.prescriptions[0].versions.length === 1 &&
+    patientView.prescriptions[0].versions[0].isCurrent === true,
+    'Patient Privacy View: Has diagnosis and active Rx (v2 only), doctor private notes redacted'
+  );
+
+  // TEST 5: Duplicate Detection Routine
+  console.log('\n--- TEST GROUP 5: PATIENT DUPLICATE DETECTION ROUTINE ---');
+  const dupCheck = await patientService.checkDuplicate({ cnic: '35201-1234567-1' });
+  assert(
+    dupCheck.isDuplicate === true && dupCheck.matchType === 'CNIC',
+    'Duplicate detection identifies existing CNIC and returns masked summary'
+  );
+  assert(
+    Boolean(dupCheck.maskedCnic && dupCheck.maskedCnic.includes('***')),
+    'Duplicate detection masks sensitive CNIC in response payload'
+  );
+
+  // TEST 6: Medical Safety Guardrails & Diagnostic Deflection
+  console.log('\n--- TEST GROUP 6: AI MEDICAL SAFETY GUARDRAILS ---');
+  const diagnosticPrompt = 'What disease is causing my high blood pressure and please prescribe me an antibiotic for infection';
+  const safetyResult = medicalSafetyGuard.evaluatePrompt(diagnosticPrompt);
+  assert(
+    safetyResult.isSafe === false && safetyResult.deflectionMessage !== undefined,
+    'Diagnostic & self-prescription query unconditionally deflected with medical disclaimer'
+  );
+
+  const aiChatResponse = await aiAgentOrchestrator.processMessage(
+    'Can you diagnose my fever and write a prescription?',
+    [],
+    { userId: 'u-pat-01', patientId: 'pat-01', userRole: 'PATIENT', sessionId: 'test-session-1' }
+  );
+  assert(
+    aiChatResponse.cardData?.type === 'SAFETY_DISCLAIMER' || aiChatResponse.content.includes('cannot provide medical diagnoses'),
+    'AI Orchestrator intercepts diagnostic query and returns safety disclaimer card'
+  );
+
+  // TEST 7: Notification Failover Pipeline
+  console.log('\n--- TEST GROUP 7: NOTIFICATION PRIMARY -> BACKUP FAILOVER ---');
+  const notifLog = await notificationService.dispatchNotification(
+    'pat-01',
+    'APPOINTMENT_CONFIRMATION',
+    'Your appointment is confirmed for today.'
+  );
+  assert(
+    notifLog.channelsAttempted.length >= 1 && ['DELIVERED_PRIMARY', 'DELIVERED_BACKUP_FAILOVER'].includes(notifLog.finalStatus),
+    'Notification pipeline dispatches to primary channel and logs immutable entry'
+  );
+
+  // TEST 8: Admin Master Access & User Blocking / Granting Controls
+  console.log('\n--- TEST GROUP 8: ADMIN USER ACCESS, BLOCKING & PRIVILEGES ---');
+  const { adminService } = await import('../src/modules/admin/admin.service');
+  
+  // 8.1: Fetch all registered users
+  const allUsers = await adminService.getAllUsers();
+  assert(allUsers.length >= 4, 'Admin can view all registered users across all roles', `Found ${allUsers.length} users`);
+
+  // 8.2: Admin blocks user access
+  const targetUser = allUsers.find(u => u.role === 'PATIENT')!;
+  const blockedResult = await adminService.updateUserAccess(targetUser.id, true, 'Violation of hospital terms', 'u-admin-01');
+  assert(blockedResult.isBlocked === true, 'Admin successfully blocks patient access');
+
+  // 8.3: Blocked user cannot log in
+  let loginBlocked = false;
+  try {
+    await authService.login({ identifier: targetUser.phone, password: 'Password123!' });
+  } catch (err: any) {
+    if (err.statusCode === 403) loginBlocked = true;
+  }
+  assert(loginBlocked, 'Blocked user is rejected with 403 Forbidden on login');
+
+  // 8.4: Admin unblocks and restores access
+  const restoredResult = await adminService.updateUserAccess(targetUser.id, false, undefined, 'u-admin-01');
+  assert(restoredResult.isBlocked === false, 'Admin restores and grants access back to user');
+
+  // 8.5: Unblocked user can log in again
+  const loginRestored = await authService.login({ identifier: targetUser.phone, password: 'Password123!' });
+  assert(loginRestored.token !== undefined, 'User successfully logs in after admin grants access back');
+
+  // 8.6: Admin creates new staff user & grants access
+  const newDoctorPhone = `+155500000${Math.floor(Math.random() * 900) + 100}`;
+  const newStaff = await adminService.createUser({
+    name: 'Dr. Zeeshan Ali',
+    phone: newDoctorPhone,
+    email: `dr.zeeshan.${Date.now()}@hospital.com`,
+    password: 'Password123!',
+    role: 'DOCTOR',
+    specialization: 'Neurology'
+  }, 'u-admin-01');
+  assert(newStaff.role === 'DOCTOR', 'Admin creates new staff member and grants access to clinical deck');
+
+  // 8.7: Safety Invariant: Root Admin cannot be blocked
+  let rootAdminBlocked = false;
+  try {
+    await adminService.updateUserAccess('u-admin-01', true, 'Trying to lock root', 'u-admin-01');
+  } catch (err: any) {
+    if (err.statusCode === 400) rootAdminBlocked = true;
+  }
+  assert(rootAdminBlocked, 'Safety invariant prevents primary Administrator from lockout');
+
+  // TEST GROUP 9: END-TO-END WORKFLOW, 48H REMINDER ENGINE & MULTI-LINGUAL CHATBOT
+  console.log('\n--- TEST GROUP 9: END-TO-END WORKFLOW, 48H REMINDER ENGINE & MULTI-LINGUAL CHATBOT ---');
+
+  // 9.1: Add new doctor
+  const docPhone = `+155500000${Math.floor(Math.random() * 800) + 100}`;
+  const newDoctorStaff = await adminService.createUser({
+    name: 'Dr. Tariq Mahmood',
+    phone: docPhone,
+    email: `dr.tariq.${Date.now()}@hospital.com`,
+    password: 'Password123!',
+    role: 'DOCTOR',
+    specialization: 'Orthopedics'
+  }, 'u-admin-01');
+  const createdDoctorProfile = db.doctors.find(d => d.userId === newDoctorStaff.id);
+  assert(Boolean(createdDoctorProfile), 'End-to-End: Admin successfully adds new specialist doctor with profile');
+
+  // 9.2: Register new patient
+  const patPhone = `+155599900${Math.floor(Math.random() * 80) + 10}`;
+  const newPatientReg = await authService.registerPatient({
+    fullName: 'Fatima Noor',
+    phone: patPhone,
+    email: `fatima.${Date.now()}@example.com`,
+    password: 'Password123!',
+    cnic: `35201-${Math.floor(Math.random() * 8999999) + 1000000}-1`,
+    gender: 'Female',
+    dateOfBirth: '1995-06-15',
+    address: 'Gulberg III, Lahore',
+    emergencyContact: '+15559991111',
+    hasWhatsApp: true,
+    primaryNotificationChannel: 'WhatsApp'
+  });
+  assert(Boolean(newPatientReg.user.profileId), 'End-to-End: New patient registered successfully');
+
+  // 9.3: Book appointment for today
+  const booking = await appointmentService.createBooking({
+    patientId: newPatientReg.user.profileId!,
+    doctorId: createdDoctorProfile!.id,
+    appointmentDate: today,
+    bookingSource: 'PORTAL'
+  }, newPatientReg.user.id, 'PATIENT');
+  assert(booking.status === 'PENDING' && typeof booking.tokenNumber === 'number', 'End-to-End: Patient books appointment and receives sequential token');
+
+  // 9.4: Front-Desk Receptionist approves/confirms booking & checks in patient
+  const confirmedBooking = await appointmentService.updateStatus(booking.id, { status: 'CONFIRMED' }, 'u-recep-01', 'RECEPTIONIST');
+  assert(confirmedBooking.status === 'CONFIRMED', 'End-to-End: Receptionist confirms patient booking');
+  await queueService.checkInPatient(booking.id, 'u-recep-01', 'RECEPTIONIST');
+
+  // 9.5: Doctor summons patient in live queue
+  const calledPatient = await queueService.callNextPatient(createdDoctorProfile!.id, newDoctorStaff.id, 'DOCTOR');
+  assert(calledPatient.calledQueueEntry.appointmentId === booking.id && calledPatient.calledQueueEntry.queueStatus === 'CALLED', 'End-to-End: Doctor summons patient in live queue');
+
+  // 9.6: Doctor completes consultation and records follow-up session (1 week out)
+  const clinicalRec = await clinicalService.createRecord({
+    appointmentId: booking.id,
+    patientId: newPatientReg.user.profileId!,
+    chiefComplaint: 'Severe knee pain and stiffness',
+    examinationNotes: 'Mild swelling on right patella',
+    diagnosis: 'Patellofemoral syndrome',
+    treatmentPlan: 'Physiotherapy exercises and follow up in 1 week',
+    medications: [
+      { name: 'Ibuprofen', dosage: '400mg', frequency: 'Twice daily', duration: '5 days', instructions: 'After meals' }
+    ]
+  }, createdDoctorProfile!.id);
+  assert(Boolean(clinicalRec.prescription) && clinicalRec.prescription?.activeVersion.versionNumber === 1, 'End-to-End: Doctor completes consultation, prescription v1 and schedules follow-up');
+
+  // 9.7: Book an upcoming follow-up session within 48h
+  const tomorrowDate = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+  const followUpBooking = await appointmentService.createBooking({
+    patientId: newPatientReg.user.profileId!,
+    doctorId: createdDoctorProfile!.id,
+    appointmentDate: tomorrowDate,
+    bookingSource: 'PORTAL'
+  }, newPatientReg.user.id, 'PATIENT');
+  await appointmentService.updateStatus(followUpBooking.id, { status: 'CONFIRMED' }, 'u-recep-01', 'RECEPTIONIST');
+
+  // 9.8: Automated 48-Hour Reminder Engine Scan
+  const reminderResult = await appointmentReminderService.scanAndDispatchUpcomingReminders(2);
+  assert(reminderResult.dispatchedCount >= 1, 'Reminder Engine: Scans upcoming 48-hour appointments and dispatches reminder');
+
+  // 9.9: Patient upcoming reminders query
+  const patientReminders = await appointmentReminderService.getUpcomingRemindersForPatient(newPatientReg.user.profileId!);
+  assert(patientReminders.length > 0 && patientReminders[0].isUpcomingSoon, 'Reminder Engine: Correctly flags appointment within 48h for patient');
+
+  // 9.10: Multi-Lingual AI Chatbot - Roman Urdu detection and response
+  const chatRomanUrdu = await aiAgentOrchestrator.processMessage(
+    'Meri appointment kab hai?',
+    [],
+    { userId: newPatientReg.user.id, patientId: newPatientReg.user.profileId!, userRole: 'PATIENT', sessionId: 's-test-01' }
+  );
+  assert(chatRomanUrdu.content.includes('Reminder') && (chatRomanUrdu.content.includes('Dr.') || chatRomanUrdu.content.includes('appointment')), 'AI Chatbot: Responds to Roman Urdu query with appointment reminder details');
+
+  // 9.11: Multi-Lingual AI Chatbot - Medical safety guardrail in Roman Urdu
+  const safetyRomanUrdu = await aiAgentOrchestrator.processMessage(
+    'Mujhe bukhar hai dawa batao',
+    [],
+    { userId: newPatientReg.user.id, patientId: newPatientReg.user.profileId!, userRole: 'PATIENT', sessionId: 's-test-02' }
+  );
+  assert(safetyRomanUrdu.cardData?.type === 'SAFETY_DISCLAIMER', 'AI Chatbot: Deflects diagnostic query with safety protocol in Roman Urdu');
+
+  // 9.12: AI Chatbot - Pharmacy & Dispensary Facility Inquiry (Roman Urdu & English)
+  const pharmaInquiry = await aiAgentOrchestrator.processMessage(
+    'Hospital pharmacy khuli hai aur dispensary kahan hai?',
+    [],
+    { userId: newPatientReg.user.id, patientId: newPatientReg.user.profileId!, userRole: 'PATIENT', sessionId: 's-test-03' }
+  );
+  assert(
+    pharmaInquiry.content.includes('Pharmacy') && pharmaInquiry.content.includes('24/7') && pharmaInquiry.cardData?.type === 'PHARMACY_INFO_CARD',
+    'AI Chatbot: Correctly provides 24/7 hospital pharmacy hours and location info'
+  );
+
+  // 9.13: AI Chatbot - Specific Medicine Inventory Stock & Pricing in PKR
+  const medStockCheck = await aiAgentOrchestrator.processMessage(
+    'Augmentin 625mg stock mein available hai aur price kya hai?',
+    [],
+    { userId: newPatientReg.user.id, patientId: newPatientReg.user.profileId!, userRole: 'PATIENT', sessionId: 's-test-04' }
+  );
+  assert(
+    medStockCheck.content.includes('Augmentin') && medStockCheck.content.includes('PKR') && medStockCheck.cardData?.type === 'MEDICINE_INFO_CARD',
+    'AI Chatbot: Accurately checks medicine inventory stock and returns PKR unit pricing'
+  );
+
+  // 9.14: AI Chatbot - Pharmacist Role Live Dispense Queue Overview
+  const pharmacistQueueCheck = await aiAgentOrchestrator.processMessage(
+    'Show pending prescriptions in live dispense queue',
+    [],
+    { userId: 'u-pharma-01', userRole: 'PHARMACIST', sessionId: 's-test-05' }
+  );
+  assert(
+    pharmacistQueueCheck.cardData?.type === 'PHARMACY_QUEUE_CARD',
+    'AI Chatbot: Generates live dispense queue report for Pharmacist staff role'
+  );
+
+  // TEST 10: PRODUCTION HANDOVER STANDARDS - CLEAN DEPARTMENT INVARIANT FOR NEW PERSONS
+  console.log('\n--- TEST GROUP 10: PRODUCTION HANDOVER STANDARDS - CLEAN DEPARTMENT INVARIANT ---');
+
+  // 10.1: Default demo receptionist (u-recep-01) sees demo data
+  const demoQueue = await queueService.getLiveQueue(undefined, today, { userId: 'u-recep-01', role: 'RECEPTIONIST' });
+  assert(demoQueue.length > 0, 'Handover: Demo receptionist retains factory test dataset for guided demos');
+
+  // Purge test-created records from earlier test groups to establish handover clean slate
+  db.purgeRoughData();
+
+  // 10.2: Newly created receptionist (Irsa) has completely EMPTY queue (0 dummy records)
+  const newRecepUser = await adminService.createUser({
+    name: 'Irsa Irshad',
+    phone: '+923001122334',
+    email: 'irsa.recep@hospital.com',
+    password: 'Password123!',
+    role: 'RECEPTIONIST'
+  });
+  const irsaQueue = await queueService.getLiveQueue(undefined, today, { userId: newRecepUser.id, role: 'RECEPTIONIST' });
+  assert(irsaQueue.length === 0, 'Handover Standard: Newly added receptionist ("Irsa") department starts completely empty (0 queue items)');
+
+  // 10.3: Newly created receptionist has completely EMPTY pending bookings
+  const irsaPending = await appointmentService.getAllAppointments({ status: 'PENDING' }, { userId: newRecepUser.id, role: 'RECEPTIONIST' });
+  assert(irsaPending.length === 0, 'Handover Standard: Newly added receptionist pending bookings starts completely empty (0 pending)');
+
+  // 10.4: Newly created doctor has completely EMPTY queue and 0 active tokens
+  const newDocUser = await adminService.createUser({
+    name: 'Dr. Salman Ahmed',
+    phone: '+923005566778',
+    email: 'dr.salman@hospital.com',
+    password: 'Password123!',
+    role: 'DOCTOR',
+    specialization: 'Neurology'
+  });
+  const docProfile = db.doctors.find(d => d.userId === newDocUser.id);
+  const docQueue = await queueService.getLiveQueue(docProfile?.id, today, { userId: newDocUser.id, role: 'DOCTOR' });
+  const docMatrix = await tokenService.getDoctorTokensMatrix(docProfile!.id, today);
+  assert(docQueue.length === 0 && docMatrix.activePatientsCount === 0, 'Handover Standard: Newly added doctor department queue and token matrix starts completely empty');
+
+  // 10.5: Newly created pharmacist has completely EMPTY dispense queue
+  const newPharmaUser = await adminService.createUser({
+    name: 'Pharmacist Usman',
+    phone: '+923009988776',
+    email: 'usman.pharma@hospital.com',
+    password: 'Password123!',
+    role: 'PHARMACIST'
+  });
+  const pharmaQueue = await pharmacyService.getDispenseQueue({ userId: newPharmaUser.id, role: 'PHARMACIST' });
+  assert(pharmaQueue.length === 0, 'Handover Standard: Newly added pharmacist live dispense queue starts completely empty');
+
+  // 10.6: Newly created patient has completely EMPTY appointments
+  const newPatientUser = await adminService.createUser({
+    name: 'Zainab Bibi',
+    phone: '+923112233445',
+    email: 'zainab.patient@hospital.com',
+    password: 'Password123!',
+    role: 'PATIENT'
+  });
+  const patProfile = db.patients.find(p => p.userId === newPatientUser.id);
+  const patientAppointments = await appointmentService.getAllAppointments({ patientId: patProfile?.id }, { userId: newPatientUser.id, role: 'PATIENT' });
+  assert(patientAppointments.length === 0, 'Handover Standard: Newly added patient portal starts completely empty');
+
+  // 10.7: Live Operational Data Booking - Real patient check-in appears with proper sequential token
+  const liveBooking = await appointmentService.createBooking(
+    {
+      patientId: patProfile!.id,
+      doctorId: docProfile!.id,
+      serviceId: 'srv-01',
+      appointmentDate: today,
+      bookingSource: 'RECEPTIONIST',
+      chiefComplaint: 'Severe migraine headache'
+    },
+    newRecepUser.id,
+    'RECEPTIONIST'
+  );
+  // Confirm and check in
+  await appointmentService.updateStatus(liveBooking.id, { status: 'CONFIRMED' }, newRecepUser.id, 'RECEPTIONIST');
+  await queueService.checkInPatient(liveBooking.id, newRecepUser.id, 'RECEPTIONIST');
+
+  // Verify it appears in Irsa's queue with clean live data
+  const irsaLiveQueue = await queueService.getLiveQueue(undefined, today, { userId: newRecepUser.id, role: 'RECEPTIONIST' });
+  assert(
+    irsaLiveQueue.length === 1 && irsaLiveQueue[0].patientName === 'Zainab Bibi' && irsaLiveQueue[0].tokenNumber === 1,
+    'Handover Standard: Live patient registered by Irsa appears in queue as Token #01 without any demo records'
+  );
+
+  // 10.8: Admin provisions user with dedicated username and comprehensive hospital details
+  const createdDoctor = await adminService.createUser({
+    username: 'dr_zubair',
+    name: 'Dr. Zubair Qureshi',
+    phone: '+923004455667',
+    email: 'zubair@hospital.com',
+    password: 'Password123!',
+    role: 'DOCTOR',
+    gender: 'Male',
+    dateOfBirth: '1980-04-15',
+    cnic: '35201-9988112-9',
+    bloodGroup: 'O+',
+    address: 'Suite 401, Doctors Plaza, Lahore',
+    emergencyContact: 'Mrs. Zubair',
+    emergencyPhone: '+923004455668',
+    department: 'Cardiology',
+    specialization: 'Interventional Cardiology',
+    licenseNumber: 'PMDC-98124-C',
+    qualifications: ['MBBS', 'FCPS', 'MRCP'],
+    experienceYears: 16,
+    consultationFee: 3000
+  });
+  assert(createdDoctor.username === 'dr_zubair', 'Handover: Dedicated @username properly assigned and registered');
+
+  // Verify getAllUsers includes the username and rich details
+  const allUsersWithDetails = await adminService.getAllUsers({ search: 'dr_zubair' });
+  assert(
+    allUsersWithDetails.length === 1 &&
+    allUsersWithDetails[0].username === 'dr_zubair' &&
+    allUsersWithDetails[0].bloodGroup === 'O+' &&
+    allUsersWithDetails[0].cnic === '35201-9988112-9',
+    'Handover: Master User Access directory returns @username and comprehensive demographic data'
+  );
+
+  // 10.9: Duplicate username conflict rejection
+  let duplicateUsernameError = false;
+  try {
+    await adminService.createUser({
+      username: 'dr_zubair',
+      name: 'Another Person',
+      phone: '+923009988111',
+      password: 'Password123!',
+      role: 'DOCTOR'
+    });
+  } catch (err: any) {
+    if (err.statusCode === 409 || err.message?.includes('already taken')) {
+      duplicateUsernameError = true;
+    }
+  }
+  assert(duplicateUsernameError, 'Validation: Rejects duplicate username with HTTP 409 Conflict');
+
+  // 10.10: Invalid username format rejection (contains spaces or illegal symbols)
+  let invalidUsernameError = false;
+  try {
+    await adminService.createUser({
+      username: 'invalid user name!',
+      name: 'Invalid User',
+      phone: '+923009988222',
+      password: 'Password123!',
+      role: 'RECEPTIONIST'
+    });
+  } catch (err: any) {
+    if (err.statusCode === 400 || err.message?.includes('Invalid username')) {
+      invalidUsernameError = true;
+    }
+  }
+  assert(invalidUsernameError, 'Validation: Rejects invalid username containing spaces and illegal characters');
+
+  // 10.11: Login authentication via @username
+  const loginByUsername = await authService.login({
+    identifier: '@dr_zubair',
+    password: 'Password123!'
+  });
+  assert(loginByUsername.user.username === 'dr_zubair', 'Auth: Allows direct secure sign-in via @username');
+
+  // 10.12: AI Chatbot Seeds Daily Clinical Data via Roman Urdu Doctor Command
+  const doctorSeedResponse = await aiAgentOrchestrator.processMessage(
+    'es kuch daily ka data dal do manay check kerna hai',
+    [],
+    {
+      userId: createdDoctor.id,
+      doctorId: db.doctors.find(d => d.userId === createdDoctor.id)?.id,
+      userRole: 'DOCTOR',
+      userName: 'Dr. Zubair Qureshi',
+      sessionId: 's-test-doctor-seed'
+    }
+  );
+  assert(
+    doctorSeedResponse.cardData?.type === 'CLINICAL_DATA_SEEDED' &&
+    doctorSeedResponse.cardData?.tokensCount === 3 &&
+    doctorSeedResponse.content.includes('Kamyabi Se Enter'),
+    'AI Chatbot: Maturely populates 3 daily clinical patients and tokens upon Roman Urdu doctor request'
+  );
+
+  // 10.13: Seeded patients immediately appear in doctor live queue as WAITING
+  const targetDoc = db.doctors.find(d => d.userId === createdDoctor.id);
+  const updatedDocQueue = await queueService.getLiveQueue(targetDoc?.id, today, { userId: createdDoctor.id, role: 'DOCTOR' });
+  assert(
+    updatedDocQueue.length === 3 && updatedDocQueue.every(q => q.queueStatus === 'WAITING'),
+    'Live Queue: Seeded patients immediately visible with WAITING status in doctor clinical queue'
+  );
+
+  // 10.14: AI Chatbot Summons Next Patient via Roman Urdu Command
+  const summonResponse = await aiAgentOrchestrator.processMessage(
+    'aglay mareez ko consultation room mein summon karo',
+    [],
+    {
+      userId: createdDoctor.id,
+      doctorId: targetDoc?.id,
+      userRole: 'DOCTOR',
+      userName: 'Dr. Zubair Qureshi',
+      sessionId: 's-test-doctor-summon'
+    }
+  );
+  assert(
+    summonResponse.cardData?.type === 'PATIENT_SUMMONED' &&
+    summonResponse.cardData?.tokenNumber === 1 &&
+    summonResponse.content.includes('Summon Kar Diya Gaya Hai'),
+    'AI Chatbot: Correctly summons next waiting patient into doctor consultation room'
+  );
+
+  // 10.15: Static RAG does not produce irrelevant false positives on conversational Roman Urdu
+  const { ragRetrieverService } = await import('../src/modules/ai-agent/rag/retriever.service');
+  const ragQueryCheck = ragRetrieverService.search('es kuch daily ka data dal do manay check kerna hai');
+  assert(
+    ragQueryCheck.length === 0,
+    'RAG Guardrail: Prevents stopword/check false-positive matches on conversational Roman Urdu commands'
+  );
+
+
+  console.log('\n========================================================');
+  console.log(`TEST SUMMARY: ${passed} PASSED | ${failed} FAILED`);
+  console.log('========================================================\n');
+
+  if (failed > 0) {
+    process.exit(1);
+  }
+}
+
+runSystemTestSuite().catch(e => {
+  console.error('Test runner fatal error:', e);
+  process.exit(1);
+});
